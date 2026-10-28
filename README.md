@@ -7,7 +7,7 @@ Callwax **seals** it into [Walrus Memory](https://docs.walrus.site) with a **Sui
 
 Built for the Walrus × Tatum “Total Recall” hackathon (Markets & Sports Prediction track).
 
-**Live:** see the deployment URL in the repo description · **Docs:** [`docs/`](docs) (blog post, demo script, submission answers)
+**Live:** https://sealed-calls-sama-5806.vercel.app · **Docs:** [`docs/`](docs) (blog post, demo script, submission answers)
 
 ## How the two sponsors are used
 
