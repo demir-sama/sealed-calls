@@ -34,13 +34,36 @@ export const AGGREGATOR = process.env.WALRUS_AGGREGATOR ?? "https://aggregator.w
 export async function writeSeal(seal: SealRecord): Promise<{ jobId: string }> {
   const text = SEAL_PREFIX + canonical(seal);
   const r = await mem().rememberAsync(text, nsOf(seal.voice.slug), { idempotencyKey: "seal:" + seal.hash });
-  return { jobId: (r.job_id ?? r.id) as string };
+  return { jobId: r.job_id as string };
 }
 
 export async function writeResolution(res: ResolutionRecord, voiceSlug: string): Promise<{ jobId: string }> {
   const text = RESOLUTION_PREFIX + canonical(res);
   const r = await mem().rememberAsync(text, nsOf(voiceSlug), { idempotencyKey: "res:" + res.sealHash });
-  return { jobId: (r.job_id ?? r.id) as string };
+  return { jobId: r.job_id as string };
+}
+
+/** Bulk write (relayer weight 10 per request, up to 20 items). Returns job ids in input order. */
+export async function writeBulk(items: { text: string; ns: string }[], idempotencyKey: string): Promise<string[]> {
+  const ids: string[] = [];
+  for (let i = 0; i < items.length; i += 20) {
+    const chunk = items.slice(i, i + 20);
+    const r = await mem().rememberBulkAsync(
+      chunk.map((c) => ({ text: c.text, namespace: c.ns })),
+      { idempotencyKey: idempotencyKey.slice(0, 100) + ":" + i },
+    );
+    ids.push(...r.job_ids);
+  }
+  return ids;
+}
+
+export async function bulkStatus(jobIds: string[]) {
+  const out: { job_id: string; status: string; blob_id?: string; error?: string }[] = [];
+  for (let i = 0; i < jobIds.length; i += 50) {
+    const r = await mem().getRememberBulkStatus(jobIds.slice(i, i + 50));
+    out.push(...((r as unknown as { results?: typeof out; items?: typeof out }).results ?? (r as unknown as { items: typeof out }).items ?? []));
+  }
+  return out;
 }
 
 export async function jobStatus(jobId: string) {
@@ -52,14 +75,6 @@ export type { SealBody, ResolutionBody };
 
 /* ---------------- hydrate ledger from Walrus ---------------- */
 
-export interface Hydrated {
-  calls: Call[];
-  voices: string[];
-  recalled: number;
-  dropped: number;
-  tookMs: number;
-  at: string;
-}
 
 interface RecalledRow {
   blob_id: string;
@@ -84,27 +99,42 @@ function parsePrefixed<T>(prefix: string, text: string): T | null {
 
 export async function hydrateVoice(slug: string): Promise<{ calls: Call[]; recalled: number; dropped: number }> {
   const ns = nsOf(slug);
-  const [seals, ress, meta] = await Promise.all([
-    recallAll(ns, "SEALED_CALL prediction claim probability deadline"),
-    recallAll(ns, "RESOLUTION outcome evidence resolved"),
-    listMeta(ns),
-  ]);
+  // one recall (weight 1) normally returns the voice's whole ledger; only fan out if the namespace outgrew one page
+  const first = await recallAll(ns, "SEALED_CALL RESOLUTION prediction outcome");
+  const rows = first.rows;
+  let dropped = first.dropped;
+  if (rows.length >= 100) {
+    const [a, b] = await Promise.all([recallAll(ns, "SEALED_CALL prediction claim probability deadline"), recallAll(ns, "RESOLUTION outcome evidence resolved")]);
+    const seen = new Set(rows.map((r) => r.blob_id));
+    for (const r of [...a.rows, ...b.rows]) {
+      if (!seen.has(r.blob_id)) {
+        seen.add(r.blob_id);
+        rows.push(r);
+      }
+    }
+    dropped += a.dropped + b.dropped;
+  }
+  const meta = await listMeta(ns);
   const byBlob = new Map(meta.map((m) => [m.blobId, m]));
   const calls = new Map<string, Call>();
-  for (const row of seals.rows) {
+  const resRows: { res: ResolutionRecord; row: RecalledRow }[] = [];
+  for (const row of rows) {
     const rec = parsePrefixed<SealRecord>(SEAL_PREFIX, row.text);
-    if (!rec || rec.v !== 1) continue;
-    const v = await verifySealRecord(rec);
-    if (!v.ok) continue; // tampered or malformed → ignored, never scored
-    const m = byBlob.get(row.blob_id);
-    calls.set(rec.id, {
-      seal: rec,
-      sealMeta: { status: "done", blobId: row.blob_id, memoryId: m?.memoryId, createdAt: row.created_at ?? m?.createdAt, size: m?.size },
-    });
-  }
-  for (const row of ress.rows) {
+    if (rec) {
+      if (rec.v !== 1) continue;
+      const v = await verifySealRecord(rec);
+      if (!v.ok) continue; // tampered or malformed → ignored, never scored
+      const m = byBlob.get(row.blob_id);
+      calls.set(rec.id, {
+        seal: rec,
+        sealMeta: { status: "done", blobId: row.blob_id, memoryId: m?.memoryId, createdAt: row.created_at ?? m?.createdAt, size: m?.size },
+      });
+      continue;
+    }
     const res = parsePrefixed<ResolutionRecord>(RESOLUTION_PREFIX, row.text);
-    if (!res) continue;
+    if (res) resRows.push({ res, row });
+  }
+  for (const { res, row } of resRows) {
     const call = calls.get(res.callId);
     if (!call || call.seal.hash !== res.sealHash) continue;
     const m = byBlob.get(row.blob_id);
@@ -113,7 +143,7 @@ export async function hydrateVoice(slug: string): Promise<{ calls: Call[]; recal
     call.resolution = res;
     call.resolutionMeta = { status: "done", blobId: row.blob_id, memoryId: m?.memoryId, createdAt: row.created_at ?? m?.createdAt, size: m?.size };
   }
-  return { calls: [...calls.values()], recalled: seals.rows.length + ress.rows.length, dropped: seals.dropped + ress.dropped };
+  return { calls: [...calls.values()], recalled: rows.length, dropped };
 }
 
 export interface MemMeta {
@@ -138,37 +168,19 @@ export async function listMeta(namespace?: string): Promise<MemMeta[]> {
   return out;
 }
 
-export async function listVoiceNamespaces(): Promise<string[]> {
-  const out: string[] = [];
+export async function listVoiceNamespaces(): Promise<{ slug: string; stamp: string; count: number }[]> {
+  const out: { slug: string; stamp: string; count: number }[] = [];
   let cursor: string | undefined;
   for (let i = 0; i < 20; i++) {
     const page = await mem().listNamespaces({ cursor } as never);
-    for (const n of page.namespaces) {
+    for (const n of page.namespaces as unknown as { name: string; memory_count: number; updated_at: string }[]) {
       const s = slugOfNs(n.name);
-      if (s) out.push(s);
+      if (s) out.push({ slug: s, stamp: `${n.memory_count}|${n.updated_at}`, count: n.memory_count });
     }
     if (!page.has_more) break;
     cursor = page.next_cursor ?? undefined;
   }
   return out;
-}
-
-export async function hydrateAll(): Promise<Hydrated> {
-  const t0 = Date.now();
-  const voices = await listVoiceNamespaces();
-  const calls: Call[] = [];
-  let recalled = 0;
-  let dropped = 0;
-  // 3 at a time to be kind to the relayer
-  for (let i = 0; i < voices.length; i += 3) {
-    const part = await Promise.all(voices.slice(i, i + 3).map((s) => hydrateVoice(s)));
-    for (const p of part) {
-      calls.push(...p.calls);
-      recalled += p.recalled;
-      dropped += p.dropped;
-    }
-  }
-  return { calls, voices, recalled, dropped, tookMs: Date.now() - t0, at: new Date().toISOString() };
 }
 
 /* ---------------- raw blob checks ---------------- */

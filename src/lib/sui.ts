@@ -14,8 +14,12 @@ export function tatumMode(): "keyed" | "anonymous" {
 // one global queue per server instance keeps us inside the gateway's per-second limit
 let chain: Promise<unknown> = Promise.resolve();
 const GAP_MS = Number(process.env.TATUM_MIN_GAP_MS ?? (process.env.TATUM_API_KEY ? 340 : 1100));
+let depth = 0;
+/** how many Tatum calls are queued/in flight in this instance (low-priority pollers back off when > 0) */
+export const queueDepth = () => depth;
 function throttled<T>(fn: () => Promise<T>): Promise<T> {
-  const run = chain.then(fn, fn);
+  depth++;
+  const run = chain.then(fn, fn).finally(() => { depth--; });
   chain = run.then(
     () => new Promise((r) => setTimeout(r, GAP_MS)),
     () => new Promise((r) => setTimeout(r, GAP_MS)),

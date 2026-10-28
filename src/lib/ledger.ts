@@ -1,31 +1,72 @@
 import "server-only";
 import { z } from "zod";
-import { randomHex, resolutionFromBody, sealFromBody, sha256Hex } from "./canon";
+import { RESOLUTION_PREFIX, SEAL_PREFIX, canonical, randomHex, resolutionFromBody, sealFromBody, sha256Hex } from "./canon";
 import { NotYet, ASSETS, LEAGUES, resolveAuto } from "./oracles";
 import { adjustProbability, voiceStats } from "./scoring";
 import { slugify } from "./slug";
 import { latestCheckpoint, toAnchor } from "./sui";
 import type { Call, Outcome, ResolutionBody, SealBody, Voice, VoiceStats } from "./types";
-import { hydrateAll, hydrateVoice, jobStatus, listMeta, nsOf, writeResolution, writeSeal, type Hydrated } from "./walrus";
+import { hydrateVoice, jobStatus, listMeta, nsOf, writeBulk, writeResolution, writeSeal, listVoiceNamespaces } from "./walrus";
 
 /* ------------------------------ cache ------------------------------ */
+// Reads are cheap (namespace listing); recalls (relayer weight 1) only happen for voices whose namespace changed.
 const TTL_MS = 25_000;
+export interface Hydrated {
+  calls: Call[];
+  voices: string[];
+  recalled: number;
+  dropped: number;
+  tookMs: number;
+  at: string;
+}
 type G = typeof globalThis & {
-  __sc?: { h?: Hydrated; at: number; flight?: Promise<Hydrated>; pending: Map<string, Call>; resolving: Set<string>; hits: Map<string, number[]> };
+  __sc?: {
+    h?: Hydrated;
+    at: number;
+    flight?: Promise<Hydrated>;
+    pending: Map<string, Call>;
+    resolving: Set<string>;
+    hits: Map<string, number[]>;
+    vc: Map<string, { stamp: string; calls: Call[]; recalled: number; dropped: number }>;
+  };
 };
 const g = globalThis as G;
-g.__sc ??= { at: 0, pending: new Map(), resolving: new Set(), hits: new Map() };
+g.__sc ??= { at: 0, pending: new Map(), resolving: new Set(), hits: new Map(), vc: new Map() };
 const S = g.__sc;
 
-export async function getLedger(opts: { fresh?: boolean } = {}): Promise<Hydrated & { calls: Call[] }> {
+async function refresh(): Promise<Hydrated> {
+  const t0 = Date.now();
+  const nss = await listVoiceNamespaces();
+  const changed = nss.filter((n) => S.vc.get(n.slug)?.stamp !== n.stamp);
+  for (let i = 0; i < changed.length; i += 3) {
+    const part = await Promise.all(changed.slice(i, i + 3).map(async (n) => ({ n, h: await hydrateVoice(n.slug) })));
+    for (const { n, h } of part) S.vc.set(n.slug, { stamp: n.stamp, ...h });
+  }
+  const live = new Set(nss.map((n) => n.slug));
+  for (const k of [...S.vc.keys()]) if (!live.has(k)) S.vc.delete(k);
+  const calls = [...S.vc.values()].flatMap((v) => v.calls);
+  let recalled = 0;
+  let dropped = 0;
+  for (const v of S.vc.values()) {
+    recalled += v.recalled;
+    dropped += v.dropped;
+  }
+  return { calls, voices: [...live], recalled, dropped, tookMs: Date.now() - t0, at: new Date().toISOString() };
+}
+
+export async function getLedger(opts: { fresh?: boolean } = {}): Promise<Hydrated> {
   const age = Date.now() - S.at;
   if (!opts.fresh && S.h && age < TTL_MS) return withPending(S.h);
   if (!S.flight) {
-    S.flight = hydrateAll()
+    S.flight = refresh()
       .then((h) => {
         S.h = h;
         S.at = Date.now();
-        for (const c of h.calls) S.pending.delete(c.seal.id); // landed in Walrus
+        // anything that has landed in Walrus no longer needs the in-process copy
+        for (const c of h.calls) {
+          const p = S.pending.get(c.seal.id);
+          if (p && (!p.resolution || c.resolution)) S.pending.delete(c.seal.id);
+        }
         return h;
       })
       .finally(() => {
@@ -38,9 +79,13 @@ export async function getLedger(opts: { fresh?: boolean } = {}): Promise<Hydrate
 }
 
 function withPending(h: Hydrated): Hydrated {
-  const have = new Set(h.calls.map((c) => c.seal.id));
-  const extra = [...S.pending.values()].filter((c) => !have.has(c.seal.id));
-  return extra.length ? { ...h, calls: [...h.calls, ...extra] } : h;
+  const byId = new Map(h.calls.map((c) => [c.seal.id, c]));
+  for (const p of S.pending.values()) {
+    const have = byId.get(p.seal.id);
+    if (!have) byId.set(p.seal.id, p);
+    else if (!have.resolution && p.resolution) byId.set(p.seal.id, { ...have, resolution: p.resolution, resolutionMeta: p.resolutionMeta });
+  }
+  return { ...h, calls: [...byId.values()] };
 }
 
 export function invalidate() {
@@ -132,7 +177,7 @@ export class HttpError extends Error {
 
 const isAdmin = (k?: string) => !!k && !!process.env.ADMIN_KEY && k === process.env.ADMIN_KEY;
 
-export async function sealCall(input: SealInput, ip = "local") {
+async function buildSeal(input: SealInput, cp: Awaited<ReturnType<typeof latestCheckpoint>>, ip = "local") {
   const admin = isAdmin(input.admin);
   if (!admin) rateLimit(ip);
   const now = Date.now();
@@ -150,7 +195,6 @@ export async function sealCall(input: SealInput, ip = "local") {
   const slug = slugify(input.voice.name);
   const sample = admin && input.sample ? true : undefined;
   const voice: Voice = { slug, name: input.voice.name, kind: input.voice.kind, ...(input.voice.handle ? { handle: input.voice.handle } : {}), ...(sample ? { sample } : {}) };
-  const cp = await latestCheckpoint();
   let resolverKey: string | undefined;
   let resolverKeyHash: string | undefined;
   if (input.rule.type === "manual") {
@@ -173,10 +217,57 @@ export async function sealCall(input: SealInput, ip = "local") {
     ...(resolverKeyHash ? { resolverKeyHash } : {}),
   };
   const seal = await sealFromBody(body);
+  return { seal, resolverKey };
+}
+
+export async function sealCall(input: SealInput, ip = "local") {
+  const cp = await latestCheckpoint();
+  const { seal, resolverKey } = await buildSeal(input, cp, ip);
   const { jobId } = await writeSeal(seal);
   const call: Call = { seal, sealMeta: { status: "pending", jobId } };
   S.pending.set(seal.id, call);
   return { call, jobId, resolverKey };
+}
+
+/** Seal many calls at once: one Sui anchor, one bulk Walrus write (weight 10 per 20 items). Admin/seed use. */
+export async function sealMany(inputs: SealInput[]) {
+  const cp = await latestCheckpoint();
+  const built = [];
+  for (const i of inputs) built.push(await buildSeal(i, cp));
+  const jobIds = await writeBulk(built.map((b) => ({ text: SEAL_PREFIX + canonical(b.seal), ns: nsOf(b.seal.voice.slug) })), "seal:" + built.map((b) => b.seal.hash.slice(0, 8)).join(""));
+  const calls = built.map((b, i): Call => {
+    const call: Call = { seal: b.seal, sealMeta: { status: "pending", jobId: jobIds[i] } };
+    S.pending.set(b.seal.id, call);
+    return call;
+  });
+  return { calls, jobIds, resolverKeys: built.map((b) => b.resolverKey) };
+}
+
+/** Auto-resolve many due calls and write all resolutions in one bulk request. */
+export async function resolveMany(calls: Call[]) {
+  const recs: { call: Call; rec: Awaited<ReturnType<typeof resolutionFromBody>> }[] = [];
+  const errors: { id: string; error: string }[] = [];
+  for (const call of calls) {
+    if (call.resolution || call.seal.rule.type === "manual") continue;
+    try {
+      const res = await resolveAuto(call.seal.rule, call.seal.deadline);
+      recs.push({
+        call,
+        rec: await resolutionFromBody({ v: 1, callId: call.seal.id, sealHash: call.seal.hash, voiceSlug: call.seal.voice.slug, outcome: res.outcome, resolvedAt: new Date().toISOString(), method: res.method, evidence: res.evidence }),
+      });
+    } catch (e) {
+      if (!(e instanceof NotYet)) errors.push({ id: call.seal.id, error: String(e instanceof Error ? e.message : e) });
+    }
+  }
+  if (recs.length) {
+    const jobIds = await writeBulk(recs.map((r) => ({ text: RESOLUTION_PREFIX + canonical(r.rec), ns: nsOf(r.call.seal.voice.slug) })), "res:" + recs.map((r) => r.rec.sealHash.slice(0, 8)).join(""));
+    recs.forEach((r, i) => {
+      r.call.resolution = r.rec;
+      r.call.resolutionMeta = { status: "pending", jobId: jobIds[i] };
+      S.pending.set(r.call.seal.id, r.call);
+    });
+  }
+  return { resolved: recs.map((r) => ({ id: r.call.seal.id, outcome: r.rec.outcome })), errors };
 }
 
 export async function sealStatus(jobId: string, id?: string) {
