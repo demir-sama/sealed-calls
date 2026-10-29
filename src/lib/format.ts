@@ -32,7 +32,7 @@ export function ruleText(r: Rule): string {
       return r.rule;
   }
 }
-export const ruleKind = (r: Rule) => (r.type === "price" ? "Price · Coinbase 1m" : r.type === "sui_metric" ? "Onchain · Sui via Tatum" : r.type === "sports" ? "Match · ESPN final" : "Manual · resolver key");
+export const ruleKind = (r: Rule) => (r.type === "price" ? "Price · Tatum / Coinbase" : r.type === "sui_metric" ? "Onchain · Sui via Tatum" : r.type === "sports" ? "Match · ESPN final" : "Manual · resolver key");
 
 export type Verdict = "open" | "due" | "held" | "broke" | "void";
 /** "held" = the voice's stated side turned out right (p>=.5 & true, or p<.5 & false) */
