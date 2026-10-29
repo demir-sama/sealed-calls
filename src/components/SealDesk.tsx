@@ -39,7 +39,7 @@ export function SealDesk() {
   const [asset, setAsset] = useState("BTC");
   const [op, setOp] = useState<"above" | "below">("above");
   const [threshold, setThreshold] = useState("");
-  const [spot, setSpot] = useState<{ price: number; time: string } | null>(null);
+  const [spot, setSpot] = useState<{ price: number; time: string; source?: string } | null>(null);
   const [metric, setMetric] = useState<"epoch" | "total_transactions" | "reference_gas_price">("epoch");
   const [mop, setMop] = useState<"at_least" | "below">("at_least");
   const [mth, setMth] = useState("");
@@ -247,8 +247,8 @@ export function SealDesk() {
                   <div><span className="label">At the deadline it’s</span><Seg<"above" | "below"> label="Direction" value={op} onChange={setOp} options={[["above", "Above"], ["below", "Below"]]} /></div>
                   <div><label className="label" htmlFor="th">Price (USD)</label><input id="th" className="field mono" inputMode="decimal" placeholder={spot ? money(spot.price) : "100000"} value={threshold} onChange={(e) => setThreshold(e.target.value.replace(/[^\d.]/g, ""))} /></div>
                   <p className="text-sm text-dim sm:col-span-3">
-                    {spot ? <>Spot now: <button type="button" className="mono text-brass underline decoration-dotted underline-offset-4" onClick={() => setThreshold(String(spot.price))}>${money(spot.price)}</button> (Coinbase). </> : <span className="skeleton inline-block h-3 w-40 align-middle" />}
-                    Resolved from the close of the last Coinbase Exchange 1-minute candle at the deadline — a public, reproducible source.
+                    {spot ? <>Spot now: <button type="button" className="mono text-brass underline decoration-dotted underline-offset-4" onClick={() => setThreshold(String(spot.price))}>${money(spot.price)}</button> ({spot.source?.startsWith("tatum") ? "Tatum" : "Coinbase"}). </> : <span className="skeleton inline-block h-3 w-40 align-middle" />}
+                    Resolved from Tatum’s rate if checked within five minutes of the deadline, otherwise from the close of the last Coinbase 1-minute candle at the deadline (public and reproducible).
                   </p>
                 </div>
               )}
