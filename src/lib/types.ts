@@ -78,7 +78,7 @@ export interface ResolutionBody {
   voiceSlug: string;
   outcome: Outcome;
   resolvedAt: string;
-  method: "auto:coinbase-1m" | "auto:sui-checkpoint" | "auto:espn-final" | "manual";
+  method: "auto:tatum-rate" | "auto:coinbase-1m" | "auto:sui-checkpoint" | "auto:espn-final" | "manual";
   /** machine-checkable evidence: observed value, sources, checkpoint ids … */
   evidence: Record<string, unknown>;
   note?: string;

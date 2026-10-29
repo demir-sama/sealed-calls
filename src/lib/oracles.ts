@@ -23,9 +23,14 @@ async function jget<T>(url: string, tries = 3): Promise<T> {
 /* ---------------- prices ---------------- */
 
 export async function spotPrice(symbol: string): Promise<{ price: number; time: string; source: string }> {
+  const tr = await tatumRate(symbol);
+  if (tr && Number.isFinite(tr.price) && tr.price > 0) return tr;
   const t = await jget<{ price: string; time: string }>(`https://api.exchange.coinbase.com/products/${productOf(symbol)}/ticker`);
   return { price: Number(t.price), time: t.time, source: "coinbase-exchange-ticker" };
 }
+
+/** Max distance between a Tatum quote and a call's deadline for it to resolve the call. */
+const TATUM_MAX_SKEW_MS = Number(process.env.TATUM_RATE_MAX_SKEW_MS ?? 5 * 60_000);
 
 /** Tatum spot rate (needs TATUM_API_KEY). */
 export async function tatumRate(symbol: string): Promise<{ price: number; time: string; source: string } | null> {
@@ -130,7 +135,7 @@ export async function sportsFinal(league: string, eventId: string) {
 
 export interface AutoResult {
   outcome: Outcome;
-  method: "auto:coinbase-1m" | "auto:sui-checkpoint" | "auto:espn-final";
+  method: "auto:tatum-rate" | "auto:coinbase-1m" | "auto:sui-checkpoint" | "auto:espn-final";
   evidence: Record<string, unknown>;
 }
 
@@ -140,6 +145,28 @@ export async function resolveAuto(rule: Rule, deadline: string): Promise<AutoRes
   const deadlineMs = Date.parse(deadline);
   if (rule.type === "price") {
     if (Date.now() < deadlineMs + 90_000) throw new NotYet("deadline not reached");
+    // Prefer Tatum's Data API rate when its quote is close enough to the deadline to stand in for it
+    // (Tatum serves the current rate only, so this applies when resolving promptly). Otherwise fall back
+    // to the reproducible Coinbase 1-minute candle.
+    const tr = await tatumRate(rule.asset);
+    if (tr && Number.isFinite(tr.price) && tr.price > 0 && Math.abs(Date.parse(tr.time) - deadlineMs) <= TATUM_MAX_SKEW_MS) {
+      const yesT = rule.op === "above" ? tr.price > rule.threshold : tr.price < rule.threshold;
+      return {
+        outcome: yesT ? "true" : "false",
+        method: "auto:tatum-rate",
+        evidence: {
+          asset: rule.asset,
+          observed: tr.price,
+          threshold: rule.threshold,
+          op: rule.op,
+          quotedAt: tr.time,
+          skewSeconds: Math.round((Date.parse(tr.time) - deadlineMs) / 1000),
+          source: `Tatum Data API exchange rate (${tr.source.replace("tatum-rate:", "")})`,
+          reproduce: `https://api.tatum.io/v4/data/rate/symbol?symbol=${rule.asset}&basePair=USD`,
+          fallback: "Coinbase Exchange 1-minute candle close",
+        },
+      };
+    }
     const p = await priceAt(rule.asset, deadline);
     const yes = rule.op === "above" ? p.price > rule.threshold : p.price < rule.threshold;
     return {
